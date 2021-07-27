@@ -1,0 +1,529 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 smarttab
+
+#pragma once
+
+#include <cassert>
+#include <cstring>
+#include <random>
+#include <string>
+#include <sstream>
+#include <utility>
+#include <vector>
+
+#include <seastar/core/thread.hh>
+
+#include "crimson/common/log.h"
+#include "stages/key_layout.h"
+#include "tree.h"
+
+/**
+ * tree_utils.h
+ *
+ * Contains shared logic for unit tests and perf tool.
+ */
+
+namespace crimson::os::seastore::onode {
+
+/**
+ * ValueItem template to work with tree utility classes:
+ *
+ * struct ValueItem {
+ *   using ValueType = ConcreteValueType;
+ *   <public members>
+ *
+ *   value_size_t get_payload_size() const;
+ *   void initialize(Transaction& t, ValueType& value) const;
+ *   void validate(ValueType& value) const;
+ *   static ValueItem create(std::size_t expected_size, std::size_t id);
+ * };
+ * std::ostream& operator<<(std::ostream& os, const ValueItem& item);
+ */
+
+template <typename ValueItem>
+void initialize_cursor_from_item(
+    Transaction& t,
+    const ghobject_t& key,
+    const ValueItem& item,
+    typename Btree<typename ValueItem::ValueType>::Cursor& cursor,
+    bool insert_success) {
+  ceph_assert(insert_success);
+  ceph_assert(!cursor.is_end());
+  ceph_assert(cursor.get_ghobj() == key);
+  auto tree_value = cursor.value();
+  item.initialize(t, tree_value);
+}
+
+
+template <typename ValueItem>
+void validate_cursor_from_item(
+    const ghobject_t& key,
+    const ValueItem& item,
+    typename Btree<typename ValueItem::ValueType>::Cursor& cursor) {
+  ceph_assert(!cursor.is_end());
+  ceph_assert(cursor.get_ghobj() == key);
+  auto value = cursor.value();
+  item.validate(value);
+}
+
+template <typename ValueItem>
+class Values {
+ public:
+  Values(size_t n) {
+    for (size_t i = 1; i <= n; ++i) {
+      auto item = create(i * 8);
+      values.push_back(item);
+    }
+  }
+
+  Values(std::vector<size_t> sizes) {
+    for (auto& size : sizes) {
+      auto item = create(size);
+      values.push_back(item);
+    }
+  }
+
+  ~Values() = default;
+
+  ValueItem create(size_t size) {
+    return ValueItem::create(size, id++);
+  }
+
+  ValueItem pick() const {
+    auto index = rd() % values.size();
+    return values[index];
+  }
+
+ private:
+  std::size_t id = 0;
+  mutable std::random_device rd;
+  std::vector<ValueItem> values;
+};
+
+template <typename ValueItem>
+class KVPool {
+ public:
+  struct kv_t {
+    ghobject_t key;
+    ValueItem value;
+  };
+  using kv_vector_t = std::vector<kv_t>;
+  using kvptr_vector_t = std::vector<kv_t*>;
+  using iterator_t = typename kvptr_vector_t::iterator;
+
+  size_t size() const {
+    return kvs.size();
+  }
+
+  iterator_t begin() {
+    return serial_p_kvs.begin();
+  }
+  iterator_t end() {
+    return serial_p_kvs.end();
+  }
+  iterator_t random_begin() {
+    return random_p_kvs.begin();
+  }
+  iterator_t random_end() {
+    return random_p_kvs.end();
+  }
+
+  void shuffle() {
+    std::random_shuffle(random_p_kvs.begin(), random_p_kvs.end());
+  }
+
+  void erase_from_random(iterator_t begin, iterator_t end) {
+    random_p_kvs.erase(begin, end);
+    kv_vector_t new_kvs;
+    for (auto p_kv : random_p_kvs) {
+      new_kvs.emplace_back(*p_kv);
+    }
+    std::sort(new_kvs.begin(), new_kvs.end(), [](auto& l, auto& r) {
+      return l.key < r.key;
+    });
+
+    kvs.swap(new_kvs);
+    serial_p_kvs.resize(kvs.size());
+    random_p_kvs.resize(kvs.size());
+    init();
+  }
+
+  static KVPool create_raw_range(
+      const std::vector<size_t>& str_sizes,
+      const std::vector<size_t>& value_sizes,
+      const std::pair<index_t, index_t>& range2,
+      const std::pair<index_t, index_t>& range1,
+      const std::pair<index_t, index_t>& range0) {
+    ceph_assert(range2.first < range2.second);
+    ceph_assert(range2.second - 1 <= MAX_SHARD);
+    ceph_assert(range2.second - 1 <= MAX_CRUSH);
+    ceph_assert(range1.first < range1.second);
+    ceph_assert(range1.second - 1 <= 9);
+    ceph_assert(range0.first < range0.second);
+
+    kv_vector_t kvs;
+    std::random_device rd;
+    Values<ValueItem> values{value_sizes};
+    for (index_t i = range2.first; i < range2.second; ++i) {
+      for (index_t j = range1.first; j < range1.second; ++j) {
+        size_t ns_size;
+        size_t oid_size;
+        if (j == 0) {
+          // store ns0, oid0 as empty strings for test purposes
+          ns_size = 0;
+          oid_size = 0;
+        } else {
+          ns_size = str_sizes[rd() % str_sizes.size()];
+          oid_size = str_sizes[rd() % str_sizes.size()];
+          assert(ns_size && oid_size);
+        }
+        for (index_t k = range0.first; k < range0.second; ++k) {
+          kvs.emplace_back(
+              kv_t{make_raw_oid(i, j, k, ns_size, oid_size), values.pick()}
+          );
+        }
+      }
+    }
+    return KVPool(std::move(kvs));
+  }
+
+  static KVPool create_range(
+      const std::pair<index_t, index_t>& range_i,
+      const std::vector<size_t>& value_sizes) {
+    kv_vector_t kvs;
+    std::random_device rd;
+    for (index_t i = range_i.first; i < range_i.second; ++i) {
+      auto value_size = value_sizes[rd() % value_sizes.size()];
+      kvs.emplace_back(
+          kv_t{make_oid(i), ValueItem::create(value_size, i)}
+      );
+    }
+    return KVPool(std::move(kvs));
+  }
+
+ private:
+  KVPool(kv_vector_t&& _kvs)
+      : kvs(std::move(_kvs)), serial_p_kvs(kvs.size()), random_p_kvs(kvs.size()) {
+    init();
+  }
+
+  void init() {
+    std::transform(kvs.begin(), kvs.end(), serial_p_kvs.begin(),
+                   [] (kv_t& item) { return &item; });
+    std::transform(kvs.begin(), kvs.end(), random_p_kvs.begin(),
+                   [] (kv_t& item) { return &item; });
+    shuffle();
+  }
+
+  static ghobject_t make_raw_oid(
+      index_t index2, index_t index1, index_t index0,
+      size_t ns_size, size_t oid_size) {
+    assert(index1 < 10);
+    std::ostringstream os_ns;
+    std::ostringstream os_oid;
+    if (index1 == 0) {
+      assert(!ns_size);
+      assert(!oid_size);
+    } else {
+      os_ns << "ns" << index1;
+      auto current_size = (size_t)os_ns.tellp();
+      assert(ns_size >= current_size);
+      os_ns << std::string(ns_size - current_size, '_');
+
+      os_oid << "oid" << index1;
+      current_size = (size_t)os_oid.tellp();
+      assert(oid_size >= current_size);
+      os_oid << std::string(oid_size - current_size, '_');
+    }
+
+    return ghobject_t(shard_id_t(index2), index2, index2,
+                      os_ns.str(), os_oid.str(), index0, index0);
+  }
+
+  static ghobject_t make_oid(index_t i) {
+    std::stringstream ss;
+    ss << "object_" << i;
+    auto ret = ghobject_t(
+      hobject_t(
+        sobject_t(ss.str(), CEPH_NOSNAP)));
+    ret.set_shard(shard_id_t(0));
+    ret.hobj.nspace = "asdf";
+    return ret;
+  }
+
+  kv_vector_t kvs;
+  kvptr_vector_t serial_p_kvs;
+  kvptr_vector_t random_p_kvs;
+};
+
+template <bool TRACK, typename ValueItem>
+class TreeBuilder {
+ public:
+  using BtreeImpl = Btree<typename ValueItem::ValueType>;
+  using BtreeCursor = typename BtreeImpl::Cursor;
+  using iterator_t = typename KVPool<ValueItem>::iterator_t;
+
+  TreeBuilder(KVPool<ValueItem>& kvs, NodeExtentManagerURef&& nm)
+      : kvs{kvs} {
+    tree.emplace(std::move(nm));
+  }
+
+  eagain_future<> bootstrap(Transaction& t) {
+    std::ostringstream oss;
+#ifndef NDEBUG
+    oss << "debug=on, ";
+#else
+    oss << "debug=off, ";
+#endif
+#ifdef UNIT_TESTS_BUILT
+    oss << "UNIT_TEST_BUILT=on, ";
+#else
+    oss << "UNIT_TEST_BUILT=off, ";
+#endif
+    if constexpr (TRACK) {
+      oss << "track=on, ";
+    } else {
+      oss << "track=off, ";
+    }
+    oss << *tree;
+    logger().warn("TreeBuilder: {}, bootstrapping ...", oss.str());
+    return tree->mkfs(t);
+  }
+
+  eagain_future<BtreeCursor> insert_one(
+      Transaction& t, const iterator_t& iter_rd) {
+    auto p_kv = *iter_rd;
+    logger().debug("[{}] insert {} -> {}",
+                   iter_rd - kvs.random_begin(),
+                   key_hobj_t{p_kv->key},
+                   p_kv->value);
+    return tree->insert(
+        t, p_kv->key, {p_kv->value.get_payload_size()}
+    ).safe_then([&t, this, p_kv](auto ret) {
+      auto success = ret.second;
+      auto cursor = std::move(ret.first);
+      initialize_cursor_from_item(t, p_kv->key, p_kv->value, cursor, success);
+#ifndef NDEBUG
+      validate_cursor_from_item(p_kv->key, p_kv->value, cursor);
+      return tree->find(t, p_kv->key
+      ).safe_then([this, cursor, p_kv](auto cursor_) mutable {
+        assert(!cursor_.is_end());
+        ceph_assert(cursor_.get_ghobj() == p_kv->key);
+        ceph_assert(cursor_.value() == cursor.value());
+        validate_cursor_from_item(p_kv->key, p_kv->value, cursor_);
+        return cursor;
+      });
+#else
+      return eagain_ertr::make_ready_future<BtreeCursor>(cursor);
+#endif
+    });
+  }
+
+  eagain_future<> insert(Transaction& t) {
+    auto ref_kv_iter = seastar::make_lw_shared<iterator_t>();
+    *ref_kv_iter = kvs.random_begin();
+    auto cursors = seastar::make_lw_shared<std::vector<BtreeCursor>>();
+    logger().warn("start inserting {} kvs ...", kvs.size());
+    auto start_time = mono_clock::now();
+    return crimson::do_until([&t, this, cursors, ref_kv_iter,
+                              start_time]() -> eagain_future<bool> {
+      if (*ref_kv_iter == kvs.random_end()) {
+        std::chrono::duration<double> duration = mono_clock::now() - start_time;
+        logger().warn("Insert done! {}s", duration.count());
+        return seastar::make_ready_future<bool>(true);
+      } else {
+        return insert_one(t, *ref_kv_iter
+        ).safe_then([cursors, ref_kv_iter] (auto cursor) {
+          if constexpr (TRACK) {
+            cursors->emplace_back(cursor);
+          }
+          ++(*ref_kv_iter);
+          return seastar::make_ready_future<bool>(false);
+        });
+      }
+    }).safe_then([&t, this, cursors, ref_kv_iter] {
+      if (!cursors->empty()) {
+        logger().info("Verifing tracked cursors ...");
+        *ref_kv_iter = kvs.random_begin();
+        return seastar::do_with(
+            cursors->begin(),
+            [&t, this, cursors, ref_kv_iter] (auto& c_iter) {
+          return crimson::do_until(
+              [&t, this, &c_iter, cursors, ref_kv_iter] () -> eagain_future<bool> {
+            if (*ref_kv_iter == kvs.random_end()) {
+              logger().info("Verify done!");
+              return seastar::make_ready_future<bool>(true);
+            }
+            assert(c_iter != cursors->end());
+            auto p_kv = **ref_kv_iter;
+            // validate values in tree keep intact
+            return tree->find(t, p_kv->key).safe_then([this, &c_iter, ref_kv_iter](auto cursor) {
+              auto p_kv = **ref_kv_iter;
+              validate_cursor_from_item(p_kv->key, p_kv->value, cursor);
+              // validate values in cursors keep intact
+              validate_cursor_from_item(p_kv->key, p_kv->value, *c_iter);
+              ++(*ref_kv_iter);
+              ++c_iter;
+              return seastar::make_ready_future<bool>(false);
+            });
+          });
+        });
+      } else {
+        return eagain_ertr::now();
+      }
+    });
+  }
+
+  eagain_future<> erase_one(
+      Transaction& t, const iterator_t& iter_rd) {
+    auto p_kv = *iter_rd;
+    logger().debug("[{}] erase {} -> {}",
+                   iter_rd - kvs.random_begin(),
+                   key_hobj_t{p_kv->key},
+                   p_kv->value);
+    return tree->erase(t, p_kv->key
+    ).safe_then([&t, this, p_kv] (auto size) {
+      ceph_assert(size == 1);
+#ifndef NDEBUG
+      return tree->contains(t, p_kv->key
+      ).safe_then([] (bool ret) {
+        ceph_assert(ret == false);
+      });
+#else
+      return eagain_ertr::now();
+#endif
+    });
+  }
+
+  eagain_future<> erase(Transaction& t, std::size_t erase_size) {
+    assert(erase_size <= kvs.size());
+    kvs.shuffle();
+    auto erase_end = kvs.random_begin() + erase_size;
+    auto ref_kv_iter = seastar::make_lw_shared<iterator_t>();
+    auto cursors = seastar::make_lw_shared<std::map<ghobject_t, BtreeCursor>>();
+    return seastar::now().then([&t, this, cursors, ref_kv_iter] {
+      if constexpr (TRACK) {
+        logger().info("Tracking cursors before erase ...");
+        *ref_kv_iter = kvs.begin();
+        auto start_time = mono_clock::now();
+        return crimson::do_until(
+            [&t, this, cursors, ref_kv_iter, start_time] () -> eagain_future<bool> {
+          if (*ref_kv_iter == kvs.end()) {
+            std::chrono::duration<double> duration = mono_clock::now() - start_time;
+            logger().info("Track done! {}s", duration.count());
+            return seastar::make_ready_future<bool>(true);
+          }
+          auto p_kv = **ref_kv_iter;
+          return tree->find(t, p_kv->key).safe_then([this, cursors, ref_kv_iter](auto cursor) {
+            auto p_kv = **ref_kv_iter;
+            validate_cursor_from_item(p_kv->key, p_kv->value, cursor);
+            cursors->emplace(p_kv->key, cursor);
+            ++(*ref_kv_iter);
+            return seastar::make_ready_future<bool>(false);
+          });
+        });
+      } else {
+        return eagain_ertr::now();
+      }
+    }).safe_then([&t, this, ref_kv_iter, erase_end] {
+      *ref_kv_iter = kvs.random_begin();
+      logger().warn("start erasing {}/{} kvs ...",
+                    erase_end - kvs.random_begin(), kvs.size());
+      auto start_time = mono_clock::now();
+      return crimson::do_until([&t, this, ref_kv_iter,
+                                start_time, erase_end] () -> eagain_future<bool> {
+        if (*ref_kv_iter == erase_end) {
+          std::chrono::duration<double> duration = mono_clock::now() - start_time;
+          logger().warn("Erase done! {}s", duration.count());
+          return seastar::make_ready_future<bool>(true);
+        } else {
+          return erase_one(t, *ref_kv_iter
+          ).safe_then([ref_kv_iter] {
+            ++(*ref_kv_iter);
+            return seastar::make_ready_future<bool>(false);
+          });
+        }
+      });
+    }).safe_then([this, cursors, ref_kv_iter, erase_end] {
+      if constexpr (TRACK) {
+        logger().info("Verifing tracked cursors ...");
+        *ref_kv_iter = kvs.random_begin();
+        while (*ref_kv_iter != erase_end) {
+          auto p_kv = **ref_kv_iter;
+          auto c_it = cursors->find(p_kv->key);
+          ceph_assert(c_it != cursors->end());
+          ceph_assert(c_it->second.is_end());
+          cursors->erase(c_it);
+          ++(*ref_kv_iter);
+        }
+      }
+      kvs.erase_from_random(kvs.random_begin(), erase_end);
+      if constexpr (TRACK) {
+        *ref_kv_iter = kvs.begin();
+        for (auto& [k, c] : *cursors) {
+          assert(*ref_kv_iter != kvs.end());
+          auto p_kv = **ref_kv_iter;
+          validate_cursor_from_item(p_kv->key, p_kv->value, c);
+          ++(*ref_kv_iter);
+        }
+        logger().info("Verify done!");
+      }
+    });
+  }
+
+  eagain_future<> get_stats(Transaction& t) {
+    return tree->get_stats_slow(t
+    ).safe_then([this](auto stats) {
+      logger().warn("{}", stats);
+    });
+  }
+
+  eagain_future<std::size_t> height(Transaction& t) {
+    return tree->height(t);
+  }
+
+  void reload(NodeExtentManagerURef&& nm) {
+    tree.emplace(std::move(nm));
+  }
+
+  eagain_future<> validate_one(
+      Transaction& t, const iterator_t& iter_seq) {
+    assert(iter_seq != kvs.end());
+    auto next_iter = iter_seq + 1;
+    auto p_kv = *iter_seq;
+    return tree->find(t, p_kv->key
+    ).safe_then([p_kv, &t] (auto cursor) {
+      validate_cursor_from_item(p_kv->key, p_kv->value, cursor);
+      return cursor.get_next(t);
+    }).safe_then([next_iter, this] (auto cursor) {
+      if (next_iter == kvs.end()) {
+        ceph_assert(cursor.is_end());
+      } else {
+        auto p_kv = *next_iter;
+        validate_cursor_from_item(p_kv->key, p_kv->value, cursor);
+      }
+    });
+  }
+
+  eagain_future<> validate(Transaction& t) {
+    return seastar::async([this, &t] {
+      logger().info("Verifing inserted ...");
+      auto iter = kvs.begin();
+      while (iter != kvs.end()) {
+        validate_one(t, iter).unsafe_get0();
+        ++iter;
+      }
+      logger().info("Verify done!");
+    });
+  }
+
+ private:
+  static seastar::logger& logger() {
+    return crimson::get_logger(ceph_subsys_test);
+  }
+
+  KVPool<ValueItem>& kvs;
+  std::optional<BtreeImpl> tree;
+};
+
+}
