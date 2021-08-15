@@ -292,6 +292,20 @@ set(cls_queue_client_srcs
   queue/cls_queue_client.cc)
 add_library(cls_queue_client STATIC ${cls_queue_client_srcs})
 
+#cls_lsm
+set(cs_lsm_srcs
+  lsm/cls_lsm.cc
+  lsm/cls_lsm_src.cc
+  ${CMAKE_SOURCE_DIR}/src/common/ceph_json.cc)
+add_library(cls_lsm SHARED ${cls_lsm_srcs})
+set_target_properties(cls_lsm PROPERTIES
+  VERSION "1.0.0"
+  SOVERSION "1"
+  INSTALL_RPATH ""
+  CXX_VISIBILITY_PRESET hidden)
+install(TARGETS cls_lsm DESTINATION ${cls_dir})
+
+
 # cls_rgw_gc
 if (WITH_RADOSGW)
   set(cls_rgw_gc_srcs
