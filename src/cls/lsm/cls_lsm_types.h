@@ -55,20 +55,20 @@ WRITE_CLASS_ENCODER(cls_lsm_column_group)
 // naming scheme rules
 struct cls_lsm_object_naming_scheme
 {
-    std::map<cls_lsm_key_range, std::string>    key_range_parts;
-    std::map<cls_lsm_column_group, std::string> clm_group_parts;
+    uint32_t                          key_range_pieces;
+    std::vector<cls_lsm_column_group> clm_group_pieces;
 
     void encode(ceph::buffer::list& bl) const {
         ENCODE_START(1, 1, bl);
-        encode(key_range_parts, bl);
-        encode(clm_group_parts, bl);
+        encode(key_range_pieces, bl);
+        encode(clm_group_pieces, bl);
         ENCODE_FINISH(bl);
     }
 
     void decode(ceph::buffer::list::const_iterator& bl) {
         DECODE_START(1, bl);
-        decode(key_range_parts, bl);
-        decode(clm_group_parts, bl);
+        decode(key_range_pieces, bl);
+        decode(clm_group_pieces, bl);
         DECODE_FINISH(bl);
     }
 };
@@ -76,7 +76,7 @@ WRITE_CLASS_ENCODER(cls_lsm_object_naming_scheme)
 
 // application data stored in the lsm node
 // key-value format; value is "column name -> bufferlist" format
-struct cls_lsm_data
+struct cls_lsm_entry
 {
     std::string key;
     std::map<std::string, ceph::buffer::list> value;
@@ -95,7 +95,7 @@ struct cls_lsm_data
         DECODE_FINISH(bl);
     }
 };
-WRITE_CLASS_ENCODER(cls_lsm_data)
+WRITE_CLASS_ENCODER(cls_lsm_entry)
 
 // lsm tree node
 struct cls_lsm_node
@@ -106,6 +106,8 @@ struct cls_lsm_node
     cls_lsm_object_naming_scheme naming_scheme;  // child node naming map
     uint64_t max_bloomfilter_data_size{0};       // max allowed space for bloom filter
     ceph::buffer::list bl_bloomfilter_data;      // special data known to apps using lsm
+    uint64_t data_start_offset;                  // marker where data starts
+    uint64_t data_end_offset;                    // marker where data ends
 
     void encode(ceph::buffer::list& bl) const {
         ENCODE_START(1, 1, bl);
@@ -115,6 +117,8 @@ struct cls_lsm_node
         encode(naming, bl);
         encode(max_bloomfilter_data_size, bl);
         encode(bl_bloomfilter_data, bl);
+        encode(data_start_offset, bl);
+        encode(data_end_offset, bl);
         ENCODE_FINISH(bl);
     }
 
@@ -126,6 +130,8 @@ struct cls_lsm_node
         decode(naming, bl);
         decode(max_bloomfilter_data_size, bl);
         decode(bl_bloomfilter_data, bl);
+        decode(data_start_offset, bl);
+        decode(data_end_offset, bl);
         DECODE_FINISH(bl);
     }
 };
